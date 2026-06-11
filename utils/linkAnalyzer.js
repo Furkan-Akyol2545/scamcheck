@@ -1,6 +1,7 @@
 // utils/linkAnalyzer.js
 // Pure JavaScript link analysis — not AI. Deterministic checks at the character level.
-// Goal: catch fake domains (e.g. govv.ie vs gov.ie) mathematically.
+// Goal: catch fake domains (e.g. govv.ie vs gov.ie) mathematically, given a brand
+// name to compare against (the brand is detected automatically by Gemini upstream).
 
 // --- Levenshtein distance: number of character edits between two strings ---
 export function levenshtein(a, b) {
@@ -136,6 +137,31 @@ export function analyzeUrl(urlString, brandName, locale) {
   if (shorteners.some((s) => host.endsWith(s))) {
     riskPoints += 15;
     signals.push(tr ? 'Gerçek hedefi gizleyen bir URL kısaltıcı.' : 'A URL shortener that hides the real destination.');
+  }
+
+  // 7) Metadata (B1): transport security and embedded-credential trick.
+  // These are read from the URL string itself — no network request, safe to run.
+  const lower = (urlString || '').trim().toLowerCase();
+  // 7a) Explicit http:// (not https) means the connection is not encrypted.
+  if (/^http:\/\//.test(lower)) {
+    riskPoints += 18;
+    signals.push(
+      tr
+        ? 'Bağlantı şifrelenmemiş (HTTPS yerine HTTP). Giriş/ödeme için güvenli değil.'
+        : 'The connection is not encrypted (HTTP instead of HTTPS). Not safe for login or payment.'
+    );
+  }
+  // 7b) "@" in the authority part is a classic trick to hide the real host
+  //     (e.g. https://paypal.com@evil.xyz actually goes to evil.xyz).
+  const afterScheme = lower.replace(/^[a-z]+:\/\//, '');
+  const authority = afterScheme.split('/')[0];
+  if (authority.includes('@')) {
+    riskPoints += 30;
+    signals.push(
+      tr
+        ? 'Adreste "@" işareti var; gerçek hedefi gizlemek için kullanılan bir hile olabilir.'
+        : 'The address contains an "@" symbol, a trick that can hide the real destination.'
+    );
   }
 
   return {

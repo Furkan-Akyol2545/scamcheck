@@ -17,8 +17,9 @@ import {
   View,
 } from 'react-native';
 import { defaultLocale, t } from './localization';
-import { extractAndAssess, crossCheck } from './utils/geminiService';
+import { extractAndAssess, crossCheck, assessUrl } from './utils/foundryService';
 import { analyzeUrls, analyzeUrl } from './utils/linkAnalyzer';
+import { checkUrlSafeBrowsing } from './utils/safeBrowsing';
 
 export default function App() {
   const [selectedImages, setSelectedImages] = useState([]);
@@ -243,49 +244,130 @@ export default function App() {
     };
   };
 
-  const buildUrlAnalysis = (urlString, locale) => {
-    // Real algorithm: typosquatting, homograph, and suspicious-structure checks
-    const single = analyzeUrl(urlString, '', locale);
-    const findings = single.signals.length
-      ? single.signals
+  const buildUrlAnalysis = async (urlString, locale) => {
+    // LAYER 1: Gemini identifies which brand (if any) this domain impersonates,
+    // and gives an independent verdict. Gemini knows real brands -> no manual list.
+    let ai;
+    try {
+      ai = await assessUrl(urlString, locale);
+    } catch (e) {
+      ai = {
+        impersonatedBrand: '',
+        isOfficialDomain: false,
+        aiVerdict: 'careful',
+        aiRiskScore: 40,
+        threatSignals: [],
+        positiveSignals: [],
+        recommendation: '',
+      };
+    }
+
+    // LAYER 2: The algorithm runs the deterministic checks, now using the real brand
+    // Gemini detected (so typosquatting like facebok.com vs facebook.com is caught).
+    const single = analyzeUrl(urlString, ai.impersonatedBrand || '', locale);
+
+    // LAYER 4 (Safe Browsing): ask Google's threat database whether this URL is a
+    // known malware/phishing site. This does NOT visit the link. If it is listed,
+    // that is a strong, authoritative danger signal that overrides "unknown".
+    let safeBrowsing = { checked: false, listed: false, signals: [], threatTypes: [] };
+    try {
+      safeBrowsing = await checkUrlSafeBrowsing(urlString, locale);
+    } catch (e) {
+      safeBrowsing = { checked: false, listed: false, signals: [], threatTypes: [] };
+    }
+
+    // If Gemini does not confidently recognize the domain, do NOT claim it is safe.
+    // Be honest: we could not get a clear result. Only the algorithm's findings stand.
+    // BUT if Safe Browsing lists it as a known threat, it is NOT "unknown" — it's dangerous.
+    const notRecognized =
+      ai.recognized === false && ai.aiVerdict === 'unknown' && !safeBrowsing.listed;
+
+    // System (algorithm) findings shown separately from AI reasoning.
+    // Safe Browsing findings are added here as authoritative technical findings.
+    const algoFindings = [...single.signals, ...safeBrowsing.signals];
+    const systemFindings = algoFindings.length
+      ? algoFindings
       : [
           locale === 'tr'
-            ? 'Bağlantıda belirgin teknik tehlike işareti bulunamadı, yine de dikkatli ol.'
-            : 'No obvious technical red flags in the link, but stay cautious.',
+            ? 'Algoritma belirgin teknik tehlike işareti bulamadı.'
+            : 'The algorithm found no obvious technical red flags.',
         ];
 
-    const riskScore = single.riskPoints;
-    const confidence = Math.min(99, 75 + Math.min(20, findings.length * 5));
+    // Threats = AI threat signals + algorithm signals + Safe Browsing signals (negatives only)
+    const indicators = [...(ai.threatSignals || []), ...algoFindings].filter(Boolean);
+
+    if (notRecognized) {
+      // Domain not confidently recognized AND not on a threat list. Be honest:
+      // show a clear "could not assess" message instead of a fake "safe" verdict.
+      // Risk is driven ONLY by the algorithm; the AI verdict is "unknown".
+      const riskScore = Math.min(100, single.riskPoints || 0);
+      return {
+        url: urlString,
+        urlInsights: [
+          locale === 'tr' ? `Barındırıcı: ${single.host}` : `Host: ${single.host}`,
+          locale === 'tr' ? 'Bu alan adı güvenle tanınmadı.' : 'This domain was not confidently recognized.',
+        ],
+        systemFindings,
+        indicators,
+        positives: [],
+        riskScore,
+        status: t(locale, 'urlNotRecognizedStatus'),
+        confidence: 0,
+        aiVerdict: 'unknown',
+        aiReasons: [t(locale, 'urlNotRecognized')],
+        recommendation: '',
+        notRecognized: true,
+      };
+    }
+
+    const positives = (ai.positiveSignals || []).filter(Boolean);
+
+    // Risk score: highest of AI risk and algorithm risk (safer side).
+    // If Safe Browsing lists the URL as a known threat, force a very high score —
+    // an authoritative database hit outweighs the model's opinion.
+    let riskScore = Math.min(100, Math.max(ai.aiRiskScore || 0, single.riskPoints || 0));
+    if (safeBrowsing.listed) {
+      riskScore = Math.max(riskScore, 95);
+    }
 
     return {
       url: urlString,
       urlInsights: [
         locale === 'tr' ? `Barındırıcı: ${single.host}` : `Host: ${single.host}`,
-        locale === 'tr'
-          ? `Tespit edilen işaret sayısı: ${single.signals.length}`
-          : `Detected signals: ${single.signals.length}`,
+        ai.impersonatedBrand
+          ? (locale === 'tr'
+              ? `Taklit edilebilecek marka: ${ai.impersonatedBrand}`
+              : `Possible impersonated brand: ${ai.impersonatedBrand}`)
+          : (locale === 'tr' ? 'Taklit edilen marka tespit edilmedi.' : 'No impersonated brand detected.'),
       ],
-      systemFindings: findings,
-      indicators: single.signals,
+      systemFindings,
+      indicators,
+      positives,
       riskScore,
       status: locale === 'tr'
         ? (riskScore > 75 ? 'Yüksek Risk' : riskScore > 40 ? 'Orta Risk' : 'Düşük Risk')
         : (riskScore > 75 ? 'High Risk' : riskScore > 40 ? 'Medium Risk' : 'Low Risk'),
-      confidence,
+      confidence: Math.min(99, 70 + (indicators.length + positives.length) * 4),
+      // AI fields (URL mode now uses Gemini too)
+      aiVerdict: ai.aiVerdict,
+      aiReasons: ai.threatSignals && ai.threatSignals.length ? ai.threatSignals : ai.positiveSignals,
+      recommendation: ai.recommendation,
     };
   };
 
   const createAiEvaluation = (analysis) => {
-    // For screenshot analysis the real AI result (aiVerdict, aiReasons) already exists.
+    // Both screenshot and URL modes now produce a real AI result (aiVerdict, aiReasons).
     // Map them to the fields the result screen expects (aiScore, aiSummary, aiComment).
-    if (analysis.inputType === 'screenshot' && analysis.aiVerdict) {
+    if (analysis.aiVerdict) {
       const aiScore = Math.max(0, Math.min(100, Math.round(analysis.riskScore)));
       const reasons = Array.isArray(analysis.aiReasons) ? analysis.aiReasons : [];
       return {
         aiScore,
         aiSummary: reasons.length
           ? reasons.join(' ')
-          : t(locale, 'aiSummaryScreenshot'),
+          : (analysis.inputType === 'screenshot'
+              ? t(locale, 'aiSummaryScreenshot')
+              : t(locale, 'aiSummaryUrl')),
         aiComment: analysis.recommendation ||
           (aiScore > 75
             ? t(locale, 'aiCommentHigh')
@@ -295,7 +377,7 @@ export default function App() {
       };
     }
 
-    // For URL analysis (algorithm-based), derive the score from risk + confidence
+    // Fallback (should rarely happen now): derive score from risk + confidence
     const aiScore = Math.max(0, Math.min(100, Math.round((analysis.riskScore * 0.8) + (analysis.confidence * 0.2))));
     const aiSummary = analysis.inputType === 'screenshot'
       ? t(locale, 'aiSummaryScreenshot')
@@ -326,7 +408,7 @@ export default function App() {
       // Screenshot analysis is now async (real Gemini call) -> await is required
       const baseResult = inputTab === 'screenshot'
         ? await buildScreenshotAnalysis(selectedImages, locale)
-        : buildUrlAnalysis(linkInput, locale);
+        : await buildUrlAnalysis(linkInput, locale);
 
       const aiEvaluation = createAiEvaluation({ ...baseResult, inputType: inputTab });
 
@@ -422,7 +504,16 @@ export default function App() {
                     {result.riskScore}
                   </Animated.Text>
                 </View>
-                <View style={[styles.statusBadge, styles.statusBadgeDanger]}>
+                <View style={[
+                  styles.statusBadge,
+                  result.notRecognized
+                    ? styles.statusBadgeNeutral
+                    : result.riskScore > 75
+                      ? styles.statusBadgeHigh
+                      : result.riskScore > 40
+                        ? styles.statusBadgeMedium
+                        : styles.statusBadgeSafe,
+                ]}>
                   <Text style={styles.statusBadgeText}>{result.status}</Text>
                 </View>
               </View>
@@ -553,6 +644,15 @@ export default function App() {
           </View>
 
           <View style={styles.reportPanel}>
+            <Text style={styles.reportSectionTitle}>{t(locale, 'aiReview')}</Text>
+            <Text style={styles.resultSummary}>{result.aiSummary}</Text>
+            <View style={styles.reportMetricRow}>
+              <Text style={styles.reportMetricLabel}>{t(locale, 'aiThreatScore')}</Text>
+              <Text style={[styles.reportMetricValue, result.aiScore > 80 ? styles.reportThreatHigh : styles.aiMediumScore]}>{result.aiScore}/100</Text>
+            </View>
+          </View>
+
+          <View style={styles.reportPanel}>
             <Text style={styles.reportSectionTitle}>{t(locale, 'detectedThreats')}</Text>
             {result.indicators && result.indicators.length > 0 ? (
               result.indicators.map((item, index) => (
@@ -566,15 +666,6 @@ export default function App() {
             ) : (
               <Text style={styles.resultSummary}>{t(locale, 'noThreatsFound')}</Text>
             )}
-          </View>
-
-          <View style={styles.reportPanel}>
-            <Text style={styles.reportSectionTitle}>{t(locale, 'aiReview')}</Text>
-            <Text style={styles.resultSummary}>{result.aiSummary}</Text>
-            <View style={styles.reportMetricRow}>
-              <Text style={styles.reportMetricLabel}>{t(locale, 'aiThreatScore')}</Text>
-              <Text style={[styles.reportMetricValue, result.aiScore > 80 ? styles.reportThreatHigh : styles.aiMediumScore]}>{result.aiScore}/100</Text>
-            </View>
           </View>
 
           <View style={styles.reportPanel}>
@@ -1636,6 +1727,18 @@ const styles = StyleSheet.create({
   },
   statusBadgeDanger: {
     backgroundColor: '#f97316',
+  },
+  statusBadgeHigh: {
+    backgroundColor: '#dc2626',
+  },
+  statusBadgeMedium: {
+    backgroundColor: '#f59e0b',
+  },
+  statusBadgeSafe: {
+    backgroundColor: '#16a34a',
+  },
+  statusBadgeNeutral: {
+    backgroundColor: '#64748b',
   },
   statusBadgeText: {
     color: '#fff',
