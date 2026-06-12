@@ -10,13 +10,15 @@ import {
   Image,
   SafeAreaView,
   ScrollView,
+  Share,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
-import { defaultLocale, t } from './localization';
+import { defaultLocale, t, resolveDeviceLocale, SUPPORTED_LOCALES, LANGUAGE_NAMES } from './localization';
+import * as Localization from 'expo-localization';
 import { extractAndAssess, crossCheck, assessUrl } from './utils/foundryService';
 import { analyzeUrls, analyzeUrl } from './utils/linkAnalyzer';
 import { checkUrlSafeBrowsing } from './utils/safeBrowsing';
@@ -25,6 +27,22 @@ export default function App() {
   const [selectedImages, setSelectedImages] = useState([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [screen, setScreen] = useState('home');
+  // Remember which screen to return to when leaving Settings (so the language
+  // button on the result/report screens returns the user to where they were).
+  const [settingsReturnScreen, setSettingsReturnScreen] = useState('home');
+
+  // On first launch, pick the app language from the device's language settings.
+  // If the device language is not one of the supported locales, this falls back
+  // to English. Runs once on mount; manual language changes afterwards are kept.
+  useEffect(() => {
+    try {
+      const deviceLocales = Localization.getLocales();
+      const resolved = resolveDeviceLocale(deviceLocales);
+      setLocale(resolved);
+    } catch (e) {
+      // If anything goes wrong, stay on the default locale.
+    }
+  }, []);
   const [analysisResult, setAnalysisResult] = useState(null);
   const [inputTab, setInputTab] = useState('screenshot');
   const [linkInput, setLinkInput] = useState('');
@@ -175,15 +193,53 @@ export default function App() {
   };
 
   // Verdict (safe/careful/scam) -> ekrandaki durum metni
-  const verdictToStatus = (verdict, locale) => {
-    if (locale === 'tr') {
-      if (verdict === 'scam') return 'Yüksek Risk';
-      if (verdict === 'safe') return 'Düşük Risk';
-      return 'Orta Risk';
+  // Share the current report as text via the device's native share sheet.
+  const handleShareReport = async () => {
+    if (!result) return;
+    try {
+      const lines = [];
+      lines.push(t(locale, 'appTitle'));
+      lines.push('');
+      // Title line: screenshot vs URL
+      if (result.inputType === 'screenshot') {
+        lines.push(t(locale, 'screenshotAnalysis'));
+      } else if (result.url) {
+        lines.push(`${t(locale, 'urlAnalysisPrefix')}${result.url}`);
+      }
+      lines.push('');
+      lines.push(`${t(locale, 'overallRiskScore')}: ${result.riskScore}/100`);
+      lines.push(`${t(locale, 'threatLevel')}: ${result.status}`);
+      lines.push('');
+      if (result.aiSummary) {
+        lines.push(`${t(locale, 'aiReview')}: ${result.aiSummary}`);
+        lines.push('');
+      }
+      if (result.indicators && result.indicators.length > 0) {
+        lines.push(`${t(locale, 'detectedThreats')}:`);
+        result.indicators.forEach((item) => lines.push(`- ${item}`));
+        lines.push('');
+      }
+      if (result.positives && result.positives.length > 0) {
+        lines.push(`${t(locale, 'positiveFindings')}:`);
+        result.positives.forEach((item) => lines.push(`- ${item}`));
+        lines.push('');
+      }
+      if (result.recommendation) {
+        lines.push(`${t(locale, 'recommendation')}: ${result.recommendation}`);
+        lines.push('');
+      }
+      lines.push(t(locale, 'shareFooter'));
+
+      await Share.share({ message: lines.join('\n') });
+    } catch (e) {
+      Alert.alert(t(locale, 'appTitle'), t(locale, 'shareError'));
     }
-    if (verdict === 'scam') return 'High Risk';
-    if (verdict === 'safe') return 'Low Risk';
-    return 'Medium Risk';
+  };
+
+  const verdictToStatus = (verdict, locale) => {
+    if (verdict === 'scam') return t(locale, 'highRisk');
+    if (verdict === 'safe') return t(locale, 'lowRisk');
+    return t(locale, 'mediumRisk');
   };
 
   // Real analysis: Gemini extraction + independent assessment,
@@ -287,11 +343,7 @@ export default function App() {
     const algoFindings = [...single.signals, ...safeBrowsing.signals];
     const systemFindings = algoFindings.length
       ? algoFindings
-      : [
-          locale === 'tr'
-            ? 'Algoritma belirgin teknik tehlike işareti bulamadı.'
-            : 'The algorithm found no obvious technical red flags.',
-        ];
+      : [t(locale, 'noTechnicalFlags')];
 
     // Threats = AI threat signals + algorithm signals + Safe Browsing signals (negatives only)
     const indicators = [...(ai.threatSignals || []), ...algoFindings].filter(Boolean);
@@ -304,8 +356,8 @@ export default function App() {
       return {
         url: urlString,
         urlInsights: [
-          locale === 'tr' ? `Barındırıcı: ${single.host}` : `Host: ${single.host}`,
-          locale === 'tr' ? 'Bu alan adı güvenle tanınmadı.' : 'This domain was not confidently recognized.',
+          `${t(locale, 'hostLabel')}: ${single.host}`,
+          t(locale, 'domainNotRecognizedLine'),
         ],
         systemFindings,
         indicators,
@@ -333,20 +385,16 @@ export default function App() {
     return {
       url: urlString,
       urlInsights: [
-        locale === 'tr' ? `Barındırıcı: ${single.host}` : `Host: ${single.host}`,
+        `${t(locale, 'hostLabel')}: ${single.host}`,
         ai.impersonatedBrand
-          ? (locale === 'tr'
-              ? `Taklit edilebilecek marka: ${ai.impersonatedBrand}`
-              : `Possible impersonated brand: ${ai.impersonatedBrand}`)
-          : (locale === 'tr' ? 'Taklit edilen marka tespit edilmedi.' : 'No impersonated brand detected.'),
+          ? `${t(locale, 'impersonatedBrandLabel')}: ${ai.impersonatedBrand}`
+          : t(locale, 'noImpersonatedBrand'),
       ],
       systemFindings,
       indicators,
       positives,
       riskScore,
-      status: locale === 'tr'
-        ? (riskScore > 75 ? 'Yüksek Risk' : riskScore > 40 ? 'Orta Risk' : 'Düşük Risk')
-        : (riskScore > 75 ? 'High Risk' : riskScore > 40 ? 'Medium Risk' : 'Low Risk'),
+      status: riskScore > 75 ? t(locale, 'highRisk') : riskScore > 40 ? t(locale, 'mediumRisk') : t(locale, 'lowRisk'),
       confidence: Math.min(99, 70 + (indicators.length + positives.length) * 4),
       // AI fields (URL mode now uses Gemini too)
       aiVerdict: ai.aiVerdict,
@@ -430,16 +478,12 @@ export default function App() {
       // Show a clear message based on the error type
       let msg = t(locale, 'analysisFailed');
       const code = String(error?.message || '');
-      if (code === 'NO_API_KEY') {
-        msg = locale === 'tr'
-          ? 'Gemini API anahtarı bulunamadı. .env dosyasına EXPO_PUBLIC_GEMINI_API_KEY ekleyip uygulamayı yeniden başlat.'
-          : 'Gemini API key not found. Add EXPO_PUBLIC_GEMINI_API_KEY to your .env and restart the app.';
-      } else if (code.startsWith('GEMINI_HTTP_')) {
-        msg = (locale === 'tr' ? 'Gemini API hatası: ' : 'Gemini API error: ') + code.replace('GEMINI_HTTP_', 'HTTP ');
-      } else if (code === 'IMAGE_READ_FAILED') {
-        msg = locale === 'tr'
-          ? 'Görsel okunamadı. expo-file-system kurulu mu kontrol et.'
-          : 'Could not read the image. Make sure expo-file-system is installed.';
+      if (code.includes('Missing API key')) {
+        msg = t(locale, 'errorNoApiKey');
+      } else if (code.includes('Foundry API error')) {
+        msg = t(locale, 'errorApiRequest');
+      } else if (code === 'IMAGE_READ_FAILED' || code.includes('image')) {
+        msg = t(locale, 'errorImageRead');
       }
       Alert.alert(t(locale, 'analysisErrorTitle'), msg);
     } finally {
@@ -450,10 +494,10 @@ export default function App() {
   if (screen === 'result') {
     const result = analysisResult || {
       riskScore: 82,
-      status: 'High Risk',
+      status: t(locale, 'highRisk'),
       confidence: 91,
-      summary: 'This screenshot contains multiple phishing signals that require verification.',
-      indicators: ['Suspicious sender metadata', 'Urgent action request', 'Hidden link structure'],
+      summary: t(locale, 'aiSummaryScreenshot'),
+      indicators: [],
       selectedCount: selectedImages.length,
     };
 
@@ -471,7 +515,10 @@ export default function App() {
               <MaterialIcons name="arrow-back-ios" size={18} color="#fff" />
               <Text style={styles.backButtonText}>{t(locale, 'back')}</Text>
             </TouchableOpacity>
-            <Animated.View style={[styles.pulseCircle, { transform: [{ scale: pulseScale }] }]} />
+            <TouchableOpacity style={styles.langButton} onPress={() => { setSettingsReturnScreen('result'); setScreen('settings'); }}>
+              <MaterialIcons name="language" size={18} color="#fff" />
+              <Text style={styles.langButtonText}>{locale.toUpperCase()}</Text>
+            </TouchableOpacity>
           </View>
 
           <View style={styles.resultHero}>
@@ -618,6 +665,10 @@ export default function App() {
               <MaterialIcons name="arrow-back-ios" size={18} color="#fff" />
               <Text style={styles.backButtonText}>{t(locale, 'backToResult')}</Text>
             </TouchableOpacity>
+            <TouchableOpacity style={styles.langButton} onPress={() => { setSettingsReturnScreen('report'); setScreen('settings'); }}>
+              <MaterialIcons name="language" size={18} color="#fff" />
+              <Text style={styles.langButtonText}>{locale.toUpperCase()}</Text>
+            </TouchableOpacity>
           </View>
 
           <View style={styles.reportHero}>
@@ -717,13 +768,9 @@ export default function App() {
           </View>
 
           <View style={styles.reportActionGroup}>
-            <TouchableOpacity style={styles.secondaryButton} onPress={() => setScreen('result')}>
-              <MaterialIcons name="share" size={18} color="#4338ca" />
-              <Text style={styles.secondaryText}>{t(locale, 'shareReport')}</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.primaryButton}>
-              <MaterialIcons name="download" size={18} color="#fff" />
-              <Text style={styles.primaryText}>{t(locale, 'exportPdf')}</Text>
+            <TouchableOpacity style={styles.primaryButton} onPress={handleShareReport}>
+              <MaterialIcons name="share" size={18} color="#fff" />
+              <Text style={styles.primaryText}>{t(locale, 'shareReport')}</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -736,9 +783,9 @@ export default function App() {
       <SafeAreaView style={[styles.safeArea, styles.settingsSafeArea]}>
         <ScrollView contentContainerStyle={styles.settingsContainer}>
           <View style={styles.settingHeader}>
-            <TouchableOpacity style={styles.backButton} onPress={() => setScreen('home')}>
-              <MaterialIcons name="arrow-back-ios" size={18} color="#fff" />
-              <Text style={styles.backButtonText}>{t(locale, 'back')}</Text>
+            <TouchableOpacity style={styles.settingsBackButton} onPress={() => setScreen(settingsReturnScreen)}>
+              <MaterialIcons name="arrow-back-ios" size={18} color="#0F6E56" />
+              <Text style={styles.settingsBackButtonText}>{t(locale, 'back')}</Text>
             </TouchableOpacity>
           </View>
 
@@ -749,20 +796,16 @@ export default function App() {
 
           <View style={styles.settingsPanel}>
             <Text style={styles.reportSectionTitle}>{t(locale, 'language')}</Text>
-            <TouchableOpacity
-              style={[styles.settingsOptionButton, locale === 'en' && styles.settingsOptionActive]}
-              onPress={() => setLocale('en')}
-            >
-              <Text style={styles.settingsOptionText}>English</Text>
-              {locale === 'en' && <Text style={styles.settingsSelectedLabel}>{t(locale, 'selected')}</Text>}
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.settingsOptionButton, locale === 'tr' && styles.settingsOptionActive]}
-              onPress={() => setLocale('tr')}
-            >
-              <Text style={styles.settingsOptionText}>Türkçe</Text>
-              {locale === 'tr' && <Text style={styles.settingsSelectedLabel}>{t(locale, 'selected')}</Text>}
-            </TouchableOpacity>
+            {SUPPORTED_LOCALES.map((code) => (
+              <TouchableOpacity
+                key={code}
+                style={[styles.settingsOptionButton, locale === code && styles.settingsOptionActive]}
+                onPress={() => setLocale(code)}
+              >
+                <Text style={styles.settingsOptionText}>{LANGUAGE_NAMES[code]}</Text>
+                {locale === code && <Text style={styles.settingsSelectedLabel}>{t(locale, 'selected')}</Text>}
+              </TouchableOpacity>
+            ))}
           </View>
 
           <View style={styles.noteCard}>
@@ -793,7 +836,7 @@ export default function App() {
             </View>
             <Text style={styles.homeBrandText}>{t(locale, 'appTitle')}</Text>
           </View>
-          <TouchableOpacity style={styles.homeSettingsButton} onPress={() => setScreen('settings')}>
+          <TouchableOpacity style={styles.homeSettingsButton} onPress={() => { setSettingsReturnScreen('home'); setScreen('settings'); }}>
             <MaterialIcons name="settings" size={20} color="#0F6E56" />
           </TouchableOpacity>
         </View>
@@ -1861,7 +1904,21 @@ const styles = StyleSheet.create({
     marginLeft: 10,
   },
   settingsSafeArea: {
-    backgroundColor: '#050816',
+    backgroundColor: '#F4FAF8',
+  },
+  settingsBackButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'flex-start',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 16,
+    backgroundColor: '#E1F5EE',
+  },
+  settingsBackButtonText: {
+    color: '#0F6E56',
+    marginLeft: 6,
+    fontWeight: '700',
   },
   settingsContainer: {
     flexGrow: 1,
@@ -1876,52 +1933,54 @@ const styles = StyleSheet.create({
     width: '100%',
     padding: 24,
     borderRadius: 28,
-    backgroundColor: '#0f172a',
+    backgroundColor: '#FFFFFF',
     borderWidth: 1,
-    borderColor: 'rgba(255,255,255,0.08)',
+    borderColor: 'rgba(15,110,86,0.12)',
     marginBottom: 20,
   },
   settingsTitle: {
     fontSize: 28,
     fontWeight: '900',
-    color: '#eef2ff',
+    color: '#0F6E56',
     marginBottom: 8,
   },
   settingsSubtitle: {
     fontSize: 15,
-    color: '#cbd5e1',
+    color: '#4B6B62',
     lineHeight: 22,
   },
   settingsPanel: {
     width: '100%',
     padding: 22,
     borderRadius: 24,
-    backgroundColor: '#111827',
+    backgroundColor: '#FFFFFF',
     marginBottom: 16,
     borderWidth: 1,
-    borderColor: 'rgba(148,163,184,0.08)',
+    borderColor: 'rgba(15,110,86,0.12)',
   },
   settingsOptionButton: {
     width: '100%',
     paddingVertical: 16,
     paddingHorizontal: 18,
     borderRadius: 18,
-    backgroundColor: 'rgba(255,255,255,0.04)',
+    backgroundColor: '#F4FAF8',
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 12,
   },
   settingsOptionActive: {
-    backgroundColor: 'rgba(67, 56, 202, 0.16)',
+    backgroundColor: '#D8F0E8',
+    borderWidth: 1,
+    borderColor: '#1D9E75',
   },
   settingsOptionText: {
-    color: '#e2e8f0',
+    color: '#143C32',
     fontSize: 16,
     fontWeight: '700',
   },
   settingsSelectedLabel: {
-    color: '#60a5fa',
+    color: '#0F6E56',
     fontSize: 14,
     fontWeight: '700',
   },
@@ -1977,7 +2036,24 @@ const styles = StyleSheet.create({
   },
   reportTopBar: {
     width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     marginBottom: 24,
+  },
+  langButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255,255,255,0.08)',
+  },
+  langButtonText: {
+    color: '#fff',
+    marginLeft: 6,
+    fontWeight: '700',
+    fontSize: 13,
   },
   reportHero: {
     width: '100%',
